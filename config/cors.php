@@ -20,28 +20,18 @@ return [
     'allowed_methods' => ['*'],
 
     'allowed_origins' => [
-        'http://localhost:3000',
+        // '*'
         'http://localhost:5173',
         'https://marketingautomation.netlify.app',
-        'https://pj8bsf4t-5173.asse.devtunnels.ms',
-        'https://pj8bsf4t-8000.asse.devtunnels.ms',
     ],
 
     'allowed_origins_patterns' => [],
 
-    'allowed_headers' => [
-        'Content-Type',
-        'X-Requested-With',
-        'Authorization',
-        'Accept',
-        'Origin',
-        'X-Bypass-Tunnel-Reminder'
-    ],
+    'allowed_headers' => ['*'],
 
     'exposed_headers' => [],
 
     'max_age' => 0,
 
-    'supports_credentials' => true,
-
+    'supports_credentials' => false,
 ];
