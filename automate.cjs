@@ -25,16 +25,38 @@ try {
     }
 }
 
-process.stderr.write("userData loaded: " + userData.email + "\n");
+process.stderr.write("userData loaded: " + JSON.stringify({
+    email: userData.email,
+    firstName: userData.firstName,
+    referredBy: userData.referredBy
+}) + "\n");
 
 (async () => {
     let browser;
     let page;
 
     try {
+        // Try to find Chromium executable path
+        let executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || null;
+        if (!executablePath) {
+            const possiblePaths = [
+                '/usr/bin/chromium',
+                '/usr/bin/chromium-browser',
+                '/usr/bin/google-chrome',
+                '/usr/bin/google-chrome-stable',
+                process.execPath.replace('node', 'chromium') // fallback
+            ];
+            for (const p of possiblePaths) {
+                if (fs.existsSync(p)) {
+                    executablePath = p;
+                    break;
+                }
+            }
+        }
+
         browser = await puppeteer.launch({
             headless: 'new',
-            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+            executablePath: executablePath,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -47,22 +69,10 @@ process.stderr.write("userData loaded: " + userData.email + "\n");
                 '--disable-extensions',
                 '--disable-breakpad',
                 '--disable-crash-reporter',
-                '--disable-crashpad-for-testing',
-                '--disable-in-process-stack-traces',
-                '--disable-logging',
-                '--disable-background-networking',
-                '--disable-sync',
-                '--disable-translate',
-                '--metrics-recording-only',
-                '--mute-audio',
-                '--hide-scrollbars',
                 '--ignore-certificate-errors',
                 '--ignore-ssl-errors',
-                '--ignore-certificate-errors-spki-list',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--allow-running-insecure-content',
                 '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
                 '--user-data-dir=/tmp/puppeteer_' + process.pid,
             ]
         });
@@ -70,7 +80,6 @@ process.stderr.write("userData loaded: " + userData.email + "\n");
         process.stderr.write("Browser launched successfully\n");
 
         page = await browser.newPage();
-
         page.setDefaultTimeout(30000);
         page.setDefaultNavigationTimeout(60000);
 
@@ -101,35 +110,60 @@ process.stderr.write("userData loaded: " + userData.email + "\n");
         await page.click('#validate_sponsor');
         process.stderr.write("Sponsor validate clicked\n");
 
+        // Wait for sponsor validation result using MutationObserver or polling
         let validated = false;
-        for (let i = 0; i < 20; i++) {
-            await new Promise(r => setTimeout(r, 500));
-            validated = await page.evaluate(() => {
+        let validationResult = null;
+
+        for (let i = 0; i < 30; i++) {
+            await page.waitForTimeout(500);
+            validationResult = await page.evaluate(() => {
                 const ok = document.querySelector('.validate_ok_2');
                 const wrong = document.querySelector('.validate_wrong_2');
                 if (ok && !ok.classList.contains('hideThis')) return 'success';
                 if (wrong && !wrong.classList.contains('hideThis')) return 'failed';
                 return false;
             });
-            process.stderr.write("Validation check " + i + ": " + String(validated) + "\n");
-            if (validated) break;
+            if (validationResult !== false) {
+                validated = true;
+                break;
+            }
         }
 
-        if (validated !== 'success') {
+        if (!validated || validationResult !== 'success') {
             // Take screenshot for debugging
             const ssPath = '/tmp/sponsor_fail_' + Date.now() + '.png';
             await page.screenshot({ path: ssPath, fullPage: true });
             process.stderr.write("Sponsor fail screenshot: " + ssPath + "\n");
-            throw new Error("Sponsor validation " + (validated || 'timeout') + " — check referredBy value");
+
+            // Also log the HTML around sponsor field
+            const sponsorHtml = await page.evaluate(() => {
+                const sponsorInput = document.querySelector('#sponsor');
+                const validateBtn = document.querySelector('#validate_sponsor');
+                const okDiv = document.querySelector('.validate_ok_2');
+                const wrongDiv = document.querySelector('.validate_wrong_2');
+                return {
+                    sponsorValue: sponsorInput ? sponsorInput.value : null,
+                    validateBtnExists: !!validateBtn,
+                    okDivVisible: okDiv && !okDiv.classList.contains('hideThis'),
+                    wrongDivVisible: wrongDiv && !wrongDiv.classList.contains('hideThis'),
+                    okDivHtml: okDiv ? okDiv.outerHTML : null,
+                };
+            });
+            process.stderr.write("Sponsor debug: " + JSON.stringify(sponsorHtml) + "\n");
+
+            throw new Error("Sponsor validation " + (validationResult || 'timeout') + " — referredBy: " + userData.referredBy);
         }
 
-        process.stderr.write("Sponsor validated\n");
+        process.stderr.write("Sponsor validated successfully\n");
 
         await page.click('#check_agree');
 
         // Wait for button to be enabled, then force-enable as fallback
         await page.waitForFunction(
-            () => !document.querySelector('#btnRegister')?.disabled,
+            () => {
+                const btn = document.querySelector('#btnRegister');
+                return btn && !btn.disabled;
+            },
             { timeout: 5000 }
         ).catch(async () => {
             process.stderr.write("Button still disabled, force-enabling\n");
@@ -152,11 +186,18 @@ process.stderr.write("userData loaded: " + userData.email + "\n");
         if (finalUrl.includes('/register')) {
             // Extract error from page
             const errorMsg = await page.evaluate(() => {
-                for (const sel of ['.alert-danger', '.alert-warning', '.text-danger', '.toast-message']) {
+                for (const sel of ['.alert-danger', '.alert-warning', '.text-danger', '.toast-message', '.error-message']) {
                     const el = document.querySelector(sel);
-                    if (el?.innerText?.trim()) return el.innerText.trim();
+                    if (el && el.innerText && el.innerText.trim()) return el.innerText.trim();
                 }
-                return 'Still on register page';
+                // Also check for any visible error-like elements
+                const errorElements = Array.from(document.querySelectorAll('[class*="error"], [class*="danger"], [class*="alert"]'));
+                for (const el of errorElements) {
+                    if (el.innerText && el.innerText.trim() && el.offsetParent !== null) {
+                        return el.innerText.trim();
+                    }
+                }
+                return 'Still on register page - no specific error message';
             });
             throw new Error(errorMsg);
         }

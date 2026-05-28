@@ -272,10 +272,87 @@ class ElevateAutomationController extends Controller
             ];
             $this->logStep("OCR_FILE_DETAILS", $fileInfo);
 
-            // Prepare API call
+            // ---------- ANTI‑TAMPERING CHECKS ----------
+            $realPath = $imageFile->getRealPath();
+
+            // 1. Verify it's a valid image using GD
+            $image = null;
+            switch ($imageFile->getMimeType()) {
+                case 'image/jpeg':
+                    $image = @imagecreatefromjpeg($realPath);
+                    break;
+                case 'image/png':
+                    $image = @imagecreatefrompng($realPath);
+                    break;
+                case 'image/jpg':
+                    $image = @imagecreatefromjpeg($realPath);
+                    break;
+                default:
+                    return response()->json(['success' => false, 'message' => 'Unsupported image format'], 422);
+            }
+
+            if (!$image) {
+                Log::warning("OCR_ANTI_TAMPER: Image could not be opened by GD - possible corruption");
+                return response()->json(['success' => false, 'message' => 'Corrupted or invalid image file'], 422);
+            }
+
+            // 2. Check image dimensions (real screenshots are usually >200px)
+            $width = imagesx($image);
+            $height = imagesy($image);
+            imagedestroy($image);
+
+            if ($width < 100 || $height < 100) {
+                Log::warning("OCR_ANTI_TAMPER: Image too small", ['width' => $width, 'height' => $height]);
+                return response()->json(['success' => false, 'message' => 'Image resolution too low – please upload a clear screenshot'], 422);
+            }
+
+            if ($width > 5000 || $height > 5000) {
+                Log::warning("OCR_ANTI_TAMPER: Image suspiciously large", ['width' => $width, 'height' => $height]);
+                return response()->json(['success' => false, 'message' => 'Image dimensions exceed allowed limit'], 422);
+            }
+
+            // 3. Verify magic bytes match the declared MIME type
+            $finfo = finfo_open(FILEINFO_MIME_TYPE);
+            $detectedMime = finfo_file($finfo, $realPath);
+            finfo_close($finfo);
+            $allowedMimes = ['image/jpeg', 'image/png', 'image/jpg'];
+            if (!in_array($detectedMime, $allowedMimes)) {
+                Log::warning("OCR_ANTI_TAMPER: MIME mismatch", ['declared' => $imageFile->getMimeType(), 'detected' => $detectedMime]);
+                return response()->json(['success' => false, 'message' => 'File type mismatch – possible tampering'], 422);
+            }
+
+            // 4. Optional: Check EXIF for editing software (non‑blocking, just log)
+            if (function_exists('exif_read_data') && in_array($detectedMime, ['image/jpeg', 'image/jpg'])) {
+                $exif = @exif_read_data($realPath);
+                if ($exif && isset($exif['Software'])) {
+                    Log::info("OCR_ANTI_TAMPER: Image edited with", ['software' => $exif['Software']]);
+                    // You can choose to reject images edited with Photoshop etc. if needed
+                }
+            }
+
+            // 5. Check for embedded PHP code (simple safety)
+            $content = file_get_contents($realPath);
+            if (strpos($content, '<?php') !== false || strpos($content, '<?=') !== false) {
+                Log::error("OCR_ANTI_TAMPER: Embedded PHP code detected");
+                return response()->json(['success' => false, 'message' => 'Security violation – invalid file content'], 422);
+            }
+
+            // 6. Check that the file size is within reasonable range (already 4MB max)
+            if ($imageFile->getSize() < 1024) { // less than 1KB is impossible for a real screenshot
+                Log::warning("OCR_ANTI_TAMPER: File suspiciously small");
+                return response()->json(['success' => false, 'message' => 'File too small – not a valid receipt screenshot'], 422);
+            }
+
+            $this->logStep("OCR_ANTI_TAMPER_PASSED", [
+                'width' => $width,
+                'height' => $height,
+                'detected_mime' => $detectedMime
+            ]);
+
+            // ---------- PROCEED WITH OCR ----------
             $apiKey = env('OCR_SPACE_API_KEY');
             if (empty($apiKey)) {
-                Log::error('OCR_SPACE_API_KEY is missing in .env');
+                Log::error('OCR_SPACE_API_KEY missing');
                 return response()->json(['success' => false, 'message' => 'OCR service misconfigured'], 500);
             }
 
@@ -284,7 +361,7 @@ class ElevateAutomationController extends Controller
 
             $response = Http::timeout(30)->attach(
                 'file',
-                file_get_contents($imageFile->getRealPath()),
+                file_get_contents($realPath),
                 $imageFile->getClientOriginalName()
             )->post($apiUrl, [
                         'apikey' => $apiKey,
@@ -324,7 +401,9 @@ class ElevateAutomationController extends Controller
                 $this->logStep("OCR_REFERENCE_CANDIDATE", ['raw_match' => $matches[0], 'cleaned' => $detectedReference]);
             }
 
-            if ($detectedReference && in_array(strlen($detectedReference), [12, 13])) {
+            // Additional validation: ensure the extracted text contains typical GCash keywords
+            $hasGcashKeyword = preg_match('/GCash|Gcash|gcash|Ref No\.|Reference/i', $extractedText);
+            if ($detectedReference && in_array(strlen($detectedReference), [12, 13]) && $hasGcashKeyword) {
                 $this->logStep("OCR_SUCCESS", [
                     'reference_number' => $detectedReference,
                     'total_duration_ms' => $responseTime
@@ -334,11 +413,12 @@ class ElevateAutomationController extends Controller
 
             Log::warning("OCR_FAILED_NO_VALID_REFERENCE", [
                 'detected_length' => $detectedReference ? strlen($detectedReference) : 'none',
+                'has_gcash_keyword' => $hasGcashKeyword,
                 'extracted_text_preview' => substr($extractedText, 0, 500),
                 'full_response_parsed' => isset($result['ErrorMessage']) ? $result['ErrorMessage'] : 'no error message'
             ]);
 
-            return response()->json(['success' => false, 'message' => 'OCR detection failed: No valid 12-13 digit reference found.'], 422);
+            return response()->json(['success' => false, 'message' => 'No valid GCash reference number found – make sure the receipt is clear and unaltered'], 422);
 
         } catch (Throwable $e) {
             Log::error("OCR_CRITICAL_FAILURE", [
