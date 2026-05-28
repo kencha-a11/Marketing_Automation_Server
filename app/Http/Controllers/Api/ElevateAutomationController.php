@@ -53,6 +53,10 @@ class ElevateAutomationController extends Controller
         if (isset($maskedPayload['password'])) {
             $maskedPayload['password'] = '******';
         }
+        // Remove file from log to avoid clutter
+        if (isset($maskedPayload['gcashQrFile'])) {
+            $maskedPayload['gcashQrFile'] = '[FILE_UPLOADED]';
+        }
         $this->logStep("REQUEST_PAYLOAD", $maskedPayload);
 
         $validator = Validator::make($request->all(), [
@@ -100,9 +104,22 @@ class ElevateAutomationController extends Controller
             return response()->json(['success' => false, 'message' => 'Database error'], 500);
         }
 
-        // Dispatch job
+        // ========== FIX: Remove file from job data ==========
+        // The file cannot be serialized, so we remove it before dispatching
+        $jobData = $validated;
+        unset($jobData['gcashQrFile']); // Remove the file object
+
+        // Optional: Store file somewhere if needed by the job
+        // For now, the job doesn't need the file since it only processes the reference number
+
+        $this->logStep("JOB_DATA_PREPARED", [
+            'has_file' => isset($validated['gcashQrFile']),
+            'job_data_keys' => array_keys($jobData)
+        ]);
+
+        // Dispatch job without the file
         try {
-            ProcessRegistration::dispatch($validated);
+            ProcessRegistration::dispatch($jobData);
             $this->logStep("JOB_DISPATCHED", [
                 'job_class' => ProcessRegistration::class,
                 'gcashRef' => $validated['gcashRef'],
@@ -113,7 +130,7 @@ class ElevateAutomationController extends Controller
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
-            return response()->json(['success' => false, 'message' => 'Job dispatch failed'], 500);
+            return response()->json(['success' => false, 'message' => 'Job dispatch failed: ' . $e->getMessage()], 500);
         }
 
         $duration = round((microtime(true) - $startTime) * 1000, 2);

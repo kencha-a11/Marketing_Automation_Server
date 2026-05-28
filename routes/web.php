@@ -130,25 +130,3 @@ Route::get('/debug-config', function (Request $request) {
         'data' => $config
     ]);
 });
-
-Route::get('/file-check', function () {
-    $path = app_path('Http/Controllers/Api/AutomationController.php');
-    try {
-        $exists = File::exists($path);
-        $contents = $exists ? 'File is readable.' : 'File not found.';
-        if ($exists) {
-            // Optional: Read the first few lines of the file to verify content
-            $contents = substr(File::get($path), 0, 500);
-        }
-        return response()->json([
-            'file_exists' => $exists,
-            'file_path' => $path,
-            'message' => $contents,
-        ]);
-    } catch (\Throwable $e) {
-        return response()->json([
-            'file_exists' => false,
-            'error' => $e->getMessage(),
-        ], 500);
-    }
-});

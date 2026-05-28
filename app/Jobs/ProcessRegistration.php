@@ -15,7 +15,7 @@ class ProcessRegistration implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public $timeout = 180;
-    public $tries = 1;
+    public $tries = 3;
     public $failOnTimeout = true;
 
     protected $data;
@@ -27,37 +27,52 @@ class ProcessRegistration implements ShouldQueue
 
     public function handle(): void
     {
-        Log::info("Job started for: " . $this->data['gcashRef']);
+        Log::info("Job started for GCash Ref: " . ($this->data['gcashRef'] ?? 'unknown'));
 
-        $payload = json_encode($this->data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        // Since we removed the file, we only process the registration data
+        // The actual automation (Node.js script) should handle the registration
+        // without needing the receipt image again
+
+        Log::info("Processing registration for: " . json_encode([
+            'email' => $this->data['email'] ?? 'unknown',
+            'gcashRef' => $this->data['gcashRef'] ?? 'unknown',
+            'firstName' => $this->data['firstName'] ?? 'unknown',
+            'lastName' => $this->data['lastName'] ?? 'unknown',
+        ]));
+
+        // Prepare job data without the file
+        $jobData = $this->data;
+
+        // If you still need to run Node.js script, pass only the necessary data
+        $payload = json_encode($jobData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         $scriptPath = base_path('automate.cjs');
 
         // Write payload to temp file
         $tmpFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'reg_' . uniqid() . '.json';
         file_put_contents($tmpFile, $payload);
-        Log::info("Temp file: " . $tmpFile);
+        Log::info("Temp file created: " . $tmpFile);
 
-        $nodePath = 'node'; // or full path like 'C:\\Program Files\\nodejs\\node.exe'
+        $nodePath = 'node';
         $command = $nodePath . ' ' . escapeshellarg($scriptPath) . ' ' . escapeshellarg($tmpFile);
-        Log::info("Command: " . $command);
+        Log::info("Executing command: " . $command);
 
         $descriptors = [
-            0 => ['pipe', 'r'],  // stdin
-            1 => ['pipe', 'w'],  // stdout
-            2 => ['pipe', 'w'],  // stderr
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
         ];
 
         $process = proc_open($command, $descriptors, $pipes, base_path());
 
         if (!is_resource($process)) {
-            Log::error("proc_open failed to start node");
+            Log::error("proc_open failed to start node process");
             $this->markFailed();
             return;
         }
 
         fclose($pipes[0]); // close stdin
 
-        // Read output with timeout
+        // Read output
         $stdout = '';
         $stderr = '';
         $startTime = time();
@@ -77,33 +92,39 @@ class ProcessRegistration implements ShouldQueue
             $chunk1 = fread($pipes[1], 4096);
             $chunk2 = fread($pipes[2], 4096);
 
-            if ($chunk1)
+            if ($chunk1 !== false)
                 $stdout .= $chunk1;
-            if ($chunk2)
+            if ($chunk2 !== false)
                 $stderr .= $chunk2;
 
             $status = proc_get_status($process);
             if (!$status['running'])
                 break;
 
-            usleep(200000); // 200ms poll
+            usleep(200000);
         }
 
         // Drain remaining output
-        $stdout .= stream_get_contents($pipes[1]);
-        $stderr .= stream_get_contents($pipes[2]);
+        $remainingOut = stream_get_contents($pipes[1]);
+        $remainingErr = stream_get_contents($pipes[2]);
+        if ($remainingOut !== false)
+            $stdout .= $remainingOut;
+        if ($remainingErr !== false)
+            $stderr .= $remainingErr;
 
         fclose($pipes[1]);
         fclose($pipes[2]);
         $exitCode = proc_close($process);
 
-        if (file_exists($tmpFile))
+        if (file_exists($tmpFile)) {
             @unlink($tmpFile);
+        }
 
-        Log::info("Exit code: " . $exitCode);
-        Log::info("Stdout: " . $stdout);
-        if ($stderr)
-            Log::info("Stderr: " . $stderr);
+        Log::info("Node process exit code: " . $exitCode);
+        Log::info("Stdout: " . substr($stdout, 0, 1000));
+        if ($stderr) {
+            Log::warning("Stderr: " . substr($stderr, 0, 1000));
+        }
 
         // Parse last JSON line from stdout
         $lines = array_filter(array_map('trim', explode("\n", $stdout)));
@@ -113,12 +134,16 @@ class ProcessRegistration implements ShouldQueue
         if ($exitCode === 0 && $output && ($output['success'] ?? false)) {
             DB::table('registrations')
                 ->where('gcash_reference_number', $this->data['gcashRef'])
-                ->update(['status' => 'success', 'redirect_url' => $output['finalUrl'] ?? '']);
-            Log::info("Success for: " . $this->data['gcashRef']);
+                ->update([
+                    'status' => 'success',
+                    'redirect_url' => $output['finalUrl'] ??
+                        'https://marketingautomation.netlify.app/dashboard?status=verified'
+                ]);
+            Log::info("Registration successful for: " . $this->data['gcashRef']);
             return;
         }
 
-        Log::error("Failed: " . ($output['error'] ?? $lastLine));
+        Log::error("Registration failed: " . ($output['error'] ?? $lastLine ?? 'Unknown error'));
         $this->markFailed();
     }
 
