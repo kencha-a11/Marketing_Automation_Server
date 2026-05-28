@@ -1,7 +1,7 @@
 FROM php:8.4-apache
 
 # ------------------------------------------------------------------
-# Install System Dependencies (including PostgreSQL and Supervisor)
+# Install System Dependencies (including Node.js, PostgreSQL, Supervisor)
 # ------------------------------------------------------------------
 RUN echo "\n[LOG] $(date '+%Y-%m-%d %H:%M:%S') - Starting system dependencies..." && \
     apt-get update && apt-get install -y \
@@ -11,10 +11,13 @@ RUN echo "\n[LOG] $(date '+%Y-%m-%d %H:%M:%S') - Starting system dependencies...
         git curl \
         libpq-dev \
         supervisor \
+        # Install Node.js 20.x
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+        && apt-get install -y nodejs \
     && docker-php-ext-install pdo_mysql gd zip bcmath pdo_pgsql \
     && a2enmod rewrite \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && echo "[LOG] $(date '+%Y-%m-%d %H:%M:%S') - System dependencies installed."
+    && echo "[LOG] $(date '+%Y-%m-%d %H:%M:%S') - System dependencies installed including Node.js $(node -v)."
 
 # ------------------------------------------------------------------
 # Install Composer (global)
@@ -39,9 +42,20 @@ COPY . .
 RUN composer dump-autoload --optimize
 
 # ------------------------------------------------------------------
+# Install Node.js dependencies (if you have package.json)
+# ------------------------------------------------------------------
+COPY package.json package-lock.json ./
+RUN if [ -f package.json ]; then npm ci --production; fi
+
+# ------------------------------------------------------------------
 # Set permissions for Laravel directories
 # ------------------------------------------------------------------
 RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
+
+# ------------------------------------------------------------------
+# Make automate.cjs executable (if it exists)
+# ------------------------------------------------------------------
+RUN if [ -f automate.cjs ]; then chmod +x automate.cjs; fi
 
 # ------------------------------------------------------------------
 # Configure Apache document root to Laravel's public folder

@@ -52,6 +52,7 @@ Route::get('/debug-logs', function (Request $request) {
     return response(implode("", $logs), 200)
         ->header('Content-Type', 'text/plain');
 });
+// create route for /debug-logs-clear
 
 Route::get('/debug-config', function (Request $request) {
     // 1. Mandatory Security Check
